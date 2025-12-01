@@ -11,6 +11,9 @@ import config
 from handlers import user_handlers, counselor_handlers, admin_handlers
 from database import Database
 
+from keep_alive import keep_alive
+keep_alive()
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
