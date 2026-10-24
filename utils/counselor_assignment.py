@@ -25,9 +25,6 @@ def assign_counselor(category: str, assignment_method: str = "round_robin") -> O
     # Get counselors from database first
     counselor_ids = db.get_counselors_by_category(category)
     
-    # If no counselors in database, check config
-    if not counselor_ids:
-        counselor_ids = config.COUNSELOR_CATEGORIES.get(category, [])
     
     if not counselor_ids:
         return None
@@ -38,7 +35,7 @@ def assign_counselor(category: str, assignment_method: str = "round_robin") -> O
         # Simple round-robin: get active sessions for this category
         # and assign to counselor with least active sessions
         active_sessions = db.get_all_active_sessions()
-        category_sessions = [s for s in active_sessions if s["category"] == category]
+        category_sessions = active_sessions
         
         # Count sessions per counselor
         counselor_session_count = {}

@@ -7,10 +7,10 @@ import os
 from typing import Dict, List
 
 # Bot token from environment variable
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8583246973:AAGtCwRugYbuIzRWu6eYkT_SdKboqKS5_tY")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 # Admin Telegram ID (bot owner)
-ADMIN_ID = int(os.getenv("ADMIN_ID", "5690529117"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # Counselor categories mapping
 # Format: category_key -> list of counselor Telegram IDs
@@ -38,8 +38,8 @@ ISSUE_CATEGORIES = {
 # Bilingual Strings
 STRINGS = {
     "welcome": {
-        "en": "👋 Welcome to the Anonymous Counseling Bot\n\nYour anonymous ID: <code>{anonymous_id}</code>\n\nYour identity is protected. Counselors will only see your anonymous ID.\n\nPlease choose your issue:",
-        "am": "👋 ወደ ሚስጥራዊ የምክር አገልግሎት ቦት እንኳን በደህና መጡ\n\nየእርስዎ ሚስጥራዊ መታወቂያ: <code>{anonymous_id}</code>\n\nማንነትዎ የተጠበቀ ነው። አማካሪዎች የእርስዎን ሚስጥራዊ መታወቂያ ብቻ ነው የሚያዩት።\n\nእባክዎ የምክር አገልግሎት የሚፈልጉበትን ጉዳይ ይምረጡ:"
+        "en": "👋 Welcome to the Anonymous Counseling Bot\n\nYour anonymous ID: <code>{anonymous_id}</code>\n\nCounselors see your anonymous ID. The service stores your Telegram ID and messages; authorized administrators can access them. Shared media may reveal your identity.\n\nPlease choose your issue:",
+        "am": "👋 ወደ ሚስጥራዊ የምክር አገልግሎት ቦት እንኳን በደህና መጡ\n\nየእርስዎ ሚስጥራዊ መታወቂያ: <code>{anonymous_id}</code>\n\nአማካሪዎች ሚስጥራዊ መታወቂያዎን ያያሉ። አገልግሎቱ የቴሌግራም መታወቂያዎን እና መልእክቶችዎን ያስቀምጣል፤ ፈቃድ ያላቸው አስተዳዳሪዎች ሊያዩአቸው ይችላሉ። የሚልኩት ሚዲያ ማንነትዎን ሊገልጽ ይችላል።\n\nእባክዎ የምክር አገልግሎት የሚፈልጉበትን ጉዳይ ይምረጡ:"
     },
     "choose_language": {
         "en": "Please select your language:",
@@ -96,9 +96,16 @@ STRINGS = {
 }
 
 # Database file path
-DATABASE_PATH = "counseling_bot.db"
+DATABASE_PATH = os.getenv("DATABASE_PATH", "counseling_bot.db")
 
 # Anonymous ID format
 ANONYMOUS_ID_PREFIX = "User-"
-ANONYMOUS_ID_LENGTH = 4  # e.g., User-2941
+ANONYMOUS_ID_LENGTH = 12  # New aliases; existing aliases are preserved
 
+
+
+def validate():
+    if not BOT_TOKEN:
+        raise ValueError("Set BOT_TOKEN in the environment")
+    if ADMIN_ID <= 0:
+        raise ValueError("Set a positive ADMIN_ID in the environment")

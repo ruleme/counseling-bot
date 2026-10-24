@@ -4,6 +4,8 @@ Handles all SQLite database operations.
 """
 
 import sqlite3
+from pathlib import Path
+from contextlib import closing
 import logging
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime
@@ -15,15 +17,17 @@ logger = logging.getLogger(__name__)
 class Database:
     """Database handler for storing users, counselors, chats, and sessions."""
     
-    def __init__(self, db_path: str = config.DATABASE_PATH):
+    def __init__(self, db_path=None):
         """Initialize database connection and create tables if they don't exist."""
-        self.db_path = db_path
+        self.db_path = str(db_path if db_path is not None else config.DATABASE_PATH)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self.init_database()
     
     def get_connection(self) -> sqlite3.Connection:
         """Get a database connection."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
     
     def init_database(self):
@@ -80,6 +84,18 @@ class Database:
             )
         """)
         
+        message_columns = {row[1] for row in cursor.execute("PRAGMA table_info(messages)")}
+        if "delivery_status" not in message_columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN delivery_status TEXT DEFAULT 'unknown'")
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(users)")}
+        if "language" not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'")
+        if cursor.execute("SELECT 1 FROM chat_sessions WHERE status='active' GROUP BY user_telegram_id HAVING COUNT(*)>1").fetchone():
+            conn.close()
+            raise RuntimeError("Duplicate active sessions: back up and resolve before startup")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_session_per_user ON chat_sessions(user_telegram_id) WHERE status='active'")
+        cursor.execute("CREATE INDEX IF NOT EXISTS sessions_counselor_status ON chat_sessions(counselor_telegram_id,status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id,message_id)")
         conn.commit()
         conn.close()
         logger.info("Database initialized successfully")
@@ -119,19 +135,12 @@ class Database:
         conn.close()
         return result[0] if result else None
     
-    def block_user(self, telegram_id: int) -> bool:
-        """Block a user."""
-        try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE users SET is_blocked = 1 WHERE telegram_id = ?", (telegram_id,))
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            logger.error(f"Error blocking user: {e}")
-            return False
-    
+    def block_user(self, telegram_id):
+        with closing(self.get_connection()) as conn, conn:
+            result = conn.execute("UPDATE users SET is_blocked=1 WHERE telegram_id=?", (telegram_id,))
+            conn.execute("UPDATE chat_sessions SET status='finished', finished_at=CURRENT_TIMESTAMP WHERE user_telegram_id=? AND status='active'", (telegram_id,))
+            return result.rowcount > 0
+
     def unblock_user(self, telegram_id: int) -> bool:
         """Unblock a user."""
         try:
@@ -162,7 +171,7 @@ class Database:
             cursor = conn.cursor()
             categories_str = ",".join(categories)
             cursor.execute(
-                "INSERT OR REPLACE INTO counselors (telegram_id, categories) VALUES (?, ?)",
+                "INSERT INTO counselors (telegram_id, categories) VALUES (?, ?) ON CONFLICT(telegram_id) DO UPDATE SET categories=excluded.categories, is_active=1",
                 (telegram_id, categories_str)
             )
             conn.commit()
@@ -177,7 +186,7 @@ class Database:
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM counselors WHERE telegram_id = ?", (telegram_id,))
+            cursor.execute("UPDATE counselors SET is_active=0 WHERE telegram_id = ?", (telegram_id,))
             conn.commit()
             conn.close()
             return True
@@ -185,23 +194,16 @@ class Database:
             logger.error(f"Error removing counselor: {e}")
             return False
     
-    def get_counselors_by_category(self, category: str) -> List[int]:
-        """Get all active counselors for a specific category."""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT telegram_id FROM counselors WHERE is_active = 1 AND categories LIKE ?",
-            (f"%{category}%",)
-        )
-        results = cursor.fetchall()
-        conn.close()
-        return [row[0] for row in results]
-    
+    def get_counselors_by_category(self, category):
+        with closing(self.get_connection()) as conn:
+            return [row[0] for row in conn.execute("SELECT telegram_id,categories FROM counselors WHERE is_active=1")
+                    if category in row[1].split(",")]
+
     def is_counselor(self, telegram_id: int) -> bool:
         """Check if a user is a counselor."""
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM counselors WHERE telegram_id = ?", (telegram_id,))
+        cursor.execute("SELECT COUNT(*) FROM counselors WHERE telegram_id = ? AND is_active=1", (telegram_id,))
         result = cursor.fetchone()
         conn.close()
         return result[0] > 0 if result else False
@@ -223,25 +225,19 @@ class Database:
         ]
     
     # Chat session operations
-    def create_chat_session(self, user_telegram_id: int, counselor_telegram_id: int, category: str) -> Optional[int]:
-        """Create a new chat session and return session_id."""
+    def create_chat_session(self, user_telegram_id, counselor_telegram_id, category):
         try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                """INSERT INTO chat_sessions 
-                   (user_telegram_id, counselor_telegram_id, category, status)
-                   VALUES (?, ?, ?, 'active')""",
-                (user_telegram_id, counselor_telegram_id, category)
-            )
-            session_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
-            return session_id
-        except Exception as e:
-            logger.error(f"Error creating chat session: {e}")
+            with closing(self.get_connection()) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                user = conn.execute("SELECT is_blocked FROM users WHERE telegram_id=?", (user_telegram_id,)).fetchone()
+                counselor = conn.execute("SELECT categories FROM counselors WHERE telegram_id=? AND is_active=1", (counselor_telegram_id,)).fetchone()
+                if not user or user[0] or not counselor or category not in counselor[0].split(','):
+                    return None
+                cursor = conn.execute("INSERT INTO chat_sessions(user_telegram_id,counselor_telegram_id,category,status) VALUES (?,?,?,'active')", (user_telegram_id,counselor_telegram_id,category))
+                return cursor.lastrowid
+        except sqlite3.IntegrityError:
             return None
-    
+
     def get_active_session(self, user_telegram_id: int) -> Optional[Dict]:
         """Get active session for a user."""
         conn = self.get_connection()
@@ -287,22 +283,10 @@ class Database:
             for row in results
         ]
     
-    def finish_session(self, session_id: int) -> bool:
-        """Mark a session as finished."""
-        try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE chat_sessions SET status = 'finished', finished_at = CURRENT_TIMESTAMP WHERE session_id = ?",
-                (session_id,)
-            )
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            logger.error(f"Error finishing session: {e}")
-            return False
-    
+    def finish_session(self, session_id):
+        with closing(self.get_connection()) as conn, conn:
+            return conn.execute("UPDATE chat_sessions SET status='finished',finished_at=CURRENT_TIMESTAMP WHERE session_id=? AND status='active'", (session_id,)).rowcount > 0
+
     def get_session_by_id(self, session_id: int) -> Optional[Dict]:
         """Get session details by session_id."""
         conn = self.get_connection()
@@ -346,30 +330,23 @@ class Database:
         ]
     
     # Message operations
-    def save_message(self, session_id: int, sender_telegram_id: int, message_type: str, content: str = None, file_id: str = None) -> bool:
-        """Save a message to the database."""
+    def save_message(self, session_id, sender_telegram_id, message_type, content=None, file_id=None):
         try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                """INSERT INTO messages (session_id, sender_telegram_id, message_type, content, file_id)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (session_id, sender_telegram_id, message_type, content, file_id)
-            )
-            conn.commit()
-            conn.close()
-            return True
-        except Exception as e:
-            logger.error(f"Error saving message: {e}")
-            return False
-    
+            with closing(self.get_connection()) as conn, conn:
+                cursor = conn.execute("INSERT INTO messages(session_id,sender_telegram_id,message_type,content,file_id,delivery_status) VALUES (?,?,?,?,?,'pending')",
+                                      (session_id,sender_telegram_id,message_type,content,file_id))
+                return cursor.lastrowid
+        except sqlite3.Error:
+            logger.error("Unable to persist message")
+            return None
+
     def get_session_messages(self, session_id: int) -> List[Dict]:
         """Get all messages for a session."""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute(
             """SELECT sender_telegram_id, message_type, content, file_id, sent_at
-               FROM messages WHERE session_id = ? ORDER BY sent_at ASC""",
+               FROM messages WHERE session_id = ? ORDER BY message_id ASC""",
             (session_id,)
         )
         results = cursor.fetchall()
@@ -385,3 +362,24 @@ class Database:
             for row in results
         ]
 
+
+    def get_language(self, telegram_id):
+        with closing(self.get_connection()) as conn:
+            row = conn.execute("SELECT language FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+            return row[0] if row and row[0] in ('en','am') else 'en'
+
+    def set_language(self, telegram_id, language):
+        if language not in ('en','am'):
+            raise ValueError("Unsupported language")
+        with closing(self.get_connection()) as conn, conn:
+            conn.execute("UPDATE users SET language=? WHERE telegram_id=?", (language,telegram_id))
+
+    def can_reply(self, session_id, counselor_id):
+        with closing(self.get_connection()) as conn:
+            return bool(conn.execute("SELECT 1 FROM chat_sessions s JOIN counselors c ON c.telegram_id=s.counselor_telegram_id JOIN users u ON u.telegram_id=s.user_telegram_id WHERE s.session_id=? AND c.telegram_id=? AND c.is_active=1 AND s.status='active' AND u.is_blocked=0", (session_id,counselor_id)).fetchone())
+
+    def set_delivery_status(self, message_id, status):
+        if status not in ("delivered", "failed"):
+            raise ValueError("Invalid delivery status")
+        with closing(self.get_connection()) as conn, conn:
+            conn.execute("UPDATE messages SET delivery_status=? WHERE message_id=?", (status,message_id))
