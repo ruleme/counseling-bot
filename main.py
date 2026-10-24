@@ -1,66 +1,69 @@
-"""
-Main entry point for the Anonymous Telegram Counseling Bot.
-"""
-
-import logging
+"""Run one polling worker with recoverable sessions and a readiness endpoint."""
 import asyncio
-from aiogram import Bot, Dispatcher
-from aiogram.fsm.storage.memory import MemoryStorage
+import contextlib
+import logging
+import os
 
 import config
-from handlers import user_handlers, counselor_handlers, admin_handlers
-from database import Database
+from keep_alive import Health, start_health_server
 
-from keep_alive import keep_alive
-keep_alive()
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
-# Initialize bot and dispatcher
-from bot_instance import get_bot, set_bot
 
-bot = Bot(token=config.BOT_TOKEN)
-set_bot(bot)  # Set global bot instance
-dp = Dispatcher(storage=MemoryStorage())
-
-# Initialize database
-db = Database()
+async def monitor(health, bot, db):
+    while True:
+        try:
+            await asyncio.wait_for(bot.get_me(), timeout=15)
+            def check_database():
+                with contextlib.closing(db.get_connection()) as conn:
+                    conn.execute("SELECT 1").fetchone()
+            await asyncio.to_thread(check_database)
+            health.mark_ready()
+        except Exception:
+            health.unavailable()
+            logger.warning("Readiness check failed")
+        await asyncio.sleep(30)
 
 
 async def main():
-    """Main function to start the bot."""
-    # Register routers (admin first so commands are processed before state handlers)
+    config.validate()
+    from aiogram import Bot, Dispatcher
+    from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
+    from bot_instance import set_bot
+    from database import Database
+    from handlers import admin_handlers, counselor_handlers, user_handlers
+    from utils.middleware import PrivateChatMiddleware
+
+    bot = Bot(token=config.BOT_TOKEN)
+    set_bot(bot)
+    dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
+    dp.message.outer_middleware(PrivateChatMiddleware())
     dp.include_router(admin_handlers.router)
     dp.include_router(counselor_handlers.router)
     dp.include_router(user_handlers.router)
-    
-    logger.info("Bot starting...")
-    
-    # Check if admin ID is set
-    if config.ADMIN_ID == 0:
-        logger.warning("⚠️ ADMIN_ID is not set! Please set it in config.py or environment variable.")
-    
-    # Check if bot token is set
-    if config.BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        logger.error("❌ BOT_TOKEN is not set! Please set it in config.py or environment variable.")
-        return
-    
-    # Start polling
+    db = Database()
+    health = Health()
+    server = start_health_server(health, int(os.getenv("PORT", "8080")))
+    task = asyncio.create_task(monitor(health, bot, db))
     try:
-        await dp.start_polling(bot, skip_updates=True)
-    except Exception as e:
-        logger.error(f"Error starting bot: {e}")
+        await bot.delete_webhook(drop_pending_updates=False)
+        logger.info("Starting polling worker")
+        await dp.start_polling(bot, close_bot_session=False)
     finally:
+        health.unavailable()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await asyncio.to_thread(server.shutdown)
+        server.server_close()
         await bot.session.close()
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # Do not expose request URLs containing the bot token through HTTP logs.
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("Bot stopped")

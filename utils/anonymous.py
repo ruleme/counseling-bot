@@ -1,38 +1,27 @@
-"""
-Utility functions for anonymous ID generation and management.
-"""
-
-import random
-import string
+"""Persistent pseudonymous aliases; existing aliases remain unchanged."""
+import secrets
+import sqlite3
+from contextlib import closing
 import config
 from database import Database
 
 db = Database()
 
 
-def generate_anonymous_id() -> str:
-    """
-    Generate a unique anonymous ID for a user.
-    Format: User-XXXX where XXXX is a random 4-digit number.
-    """
-    while True:
-        # Generate random 4-digit number
-        random_number = random.randint(1000, 9999)
-        anonymous_id = f"{config.ANONYMOUS_ID_PREFIX}{random_number}"
-        
-        # Check if ID already exists
-        if db.get_user_telegram_id(anonymous_id) is None:
-            return anonymous_id
+def generate_anonymous_id():
+    return config.ANONYMOUS_ID_PREFIX + secrets.token_hex(6).upper()
 
 
-def get_or_create_anonymous_id(telegram_id: int) -> str:
-    """
-    Get existing anonymous ID for a user or create a new one.
-    Returns the anonymous ID.
-    """
-    anonymous_id = db.get_user_anonymous_id(telegram_id)
-    if anonymous_id is None:
-        anonymous_id = generate_anonymous_id()
-        db.create_user(telegram_id, anonymous_id)
-    return anonymous_id
-
+def get_or_create_anonymous_id(telegram_id):
+    with closing(db.get_connection()) as conn, conn:
+        for _ in range(10):
+            existing = conn.execute("SELECT anonymous_id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+            if existing:
+                return existing[0]
+            alias = generate_anonymous_id()
+            try:
+                conn.execute("INSERT INTO users(telegram_id,anonymous_id) VALUES (?,?)", (telegram_id,alias))
+                return alias
+            except sqlite3.IntegrityError:
+                continue
+    raise RuntimeError("Unable to allocate anonymous alias")

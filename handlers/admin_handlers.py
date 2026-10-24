@@ -7,11 +7,11 @@ import logging
 import json
 from datetime import datetime
 from aiogram import Router, F
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, BufferedInputFile
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-import os
+from contextlib import closing
 
 from database import Database
 from keyboards.menus import get_admin_menu_keyboard
@@ -131,7 +131,7 @@ async def cmd_add_counselor(message: Message):
             )
         else:
             await message.answer("❌ Error adding counselor.")
-    except ValueError:
+    except (ValueError, TypeError):
         await message.answer("❌ Invalid counselor ID. Must be a number.")
 
 
@@ -153,7 +153,7 @@ async def cmd_remove_counselor(message: Message):
             await message.answer(f"✅ Counselor {counselor_id} removed successfully.")
         else:
             await message.answer("❌ Error removing counselor.")
-    except ValueError:
+    except (ValueError, TypeError):
         await message.answer("❌ Invalid counselor ID. Must be a number.")
 
 
@@ -172,7 +172,7 @@ async def show_active_sessions(message: Message):
     sessions_text = "📊 Active Sessions:\n\n"
     for session in sessions:
         user_anonymous_id = db.get_user_anonymous_id(session["user_telegram_id"])
-        category = config.ISSUE_CATEGORIES.get(session["category"], session["category"])
+        category = config.ISSUE_CATEGORIES.get(session["category"], {"en": session["category"]})["en"]
         sessions_text += (
             f"• Session ID: {session['session_id']}\n"
             f"  User: {user_anonymous_id} (ID: {session['user_telegram_id']})\n"
@@ -198,7 +198,7 @@ async def start_block_user(message: Message, state: FSMContext):
     await state.set_state(AdminStates.blocking_user)
 
 
-@router.message(StateFilter(AdminStates.blocking_user))
+@router.message(StateFilter(AdminStates.blocking_user), ~F.text.startswith("/"))
 async def handle_block_user(message: Message, state: FSMContext):
     """Handle blocking a user."""
     if not is_admin(message.from_user.id):
@@ -206,13 +206,13 @@ async def handle_block_user(message: Message, state: FSMContext):
         return
     
     try:
-        user_id = int(message.text)
+        user_id = int(message.text or "")
         
         if db.block_user(user_id):
             await message.answer(f"✅ User {user_id} has been blocked.")
         else:
             await message.answer("❌ Error blocking user.")
-    except ValueError:
+    except (ValueError, TypeError):
         await message.answer("❌ Invalid user ID. Must be a number.")
     
     await state.clear()
@@ -236,7 +236,7 @@ async def cmd_unblock_user(message: Message):
             await message.answer(f"✅ User {user_id} has been unblocked.")
         else:
             await message.answer("❌ Error unblocking user.")
-    except ValueError:
+    except (ValueError, TypeError):
         await message.answer("❌ Invalid user ID. Must be a number.")
 
 
@@ -265,11 +265,11 @@ async def cmd_force_end(message: Message):
             await message.answer(f"✅ Session {active_session['session_id']} has been force-ended for user {user_id}.")
         else:
             await message.answer(f"❌ Failed to end session for user {user_id}.")
-    except ValueError:
+    except (ValueError, TypeError):
         await message.answer("❌ Invalid user ID. Must be a number.")
     except Exception as e:
         logger.error(f"Error in force_end: {e}")
-        await message.answer(f"❌ Error: {str(e)}")
+        await message.answer("❌ Operation failed. Please try again.")
 
 
 @router.message(F.text == "📥 Export Logs")
@@ -303,17 +303,17 @@ async def export_logs(message: Message):
             session_log = {
                 "session_id": session_id,
                 "user_anonymous_id": user_anonymous_id,
-                "user_telegram_id": session[1],  # Admin can see real IDs
-                "counselor_telegram_id": session[2],
+                "identity_redacted": True,
+                
                 "category": session[3],
                 "created_at": session[4],
                 "finished_at": session[5],
                 "messages": [
                     {
-                        "sender_telegram_id": msg["sender_telegram_id"],
+                        "sender_role": "user" if msg["sender_telegram_id"] == session[1] else "counselor",
                         "message_type": msg["message_type"],
                         "content": msg["content"],
-                        "file_id": msg["file_id"],
+                        
                         "sent_at": msg["sent_at"]
                     }
                     for msg in messages
@@ -332,31 +332,12 @@ async def export_logs(message: Message):
         
         export_text = json.dumps(export_data, indent=2, ensure_ascii=False)
         
-        # Send as document if too long, otherwise as text
-        if len(export_text) > 4000:
-            # Save to file and send
-            filename = f"logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(export_text)
-            
-            try:
-                document = FSInputFile(filename)
-                await message.answer_document(
-                    document=document,
-                    caption=f"📥 Chat logs export\n{len(logs)} sessions"
-                )
-            finally:
-                # Clean up file
-                if os.path.exists(filename):
-                    os.remove(filename)
-        else:
-            await message.answer(
-                f"📥 Chat Logs Export\n\n"
-                f"Total Sessions: {len(logs)}\n\n"
-                f"<code>{export_text}</code>",
-                parse_mode="HTML"
-            )
-    except Exception as e:
-        logger.error(f"Error exporting logs: {e}")
+        # Send only to the configured admin, without HTML or disk transcripts.
+        await message.bot.send_document(
+            config.ADMIN_ID,
+            BufferedInputFile(export_text.encode("utf-8"), filename="counseling_logs.json"),
+            caption=f"Chat logs export: {len(logs)} sessions. Treat transcripts as sensitive."
+        )
+    except Exception:
+        logger.exception("Error exporting logs")
         await message.answer("❌ Error exporting logs.")
-

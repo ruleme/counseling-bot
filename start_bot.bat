@@ -1,4 +1,4 @@
 @echo off
-cd /d "d:\GFX\fellow kue\counseling"
+cd /d "%~dp0"
 python main.py
 pause

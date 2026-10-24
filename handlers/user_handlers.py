@@ -1,16 +1,4 @@
-"""
-User handlers for the Anonymous Telegram Counseling Bot.
-Handles user interactions, issue selection, and messaging.
-"""
-
-import logging
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.filters import Command, StateFilter
-"""
-User handlers for the Anonymous Telegram Counseling Bot.
-Handles user interactions, issue selection, and messaging.
-"""
+"""User interactions and anonymous message relay."""
 
 import logging
 from aiogram import Router, F
@@ -20,9 +8,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from database import Database
+from utils.relay import payload, deliver
 from utils.anonymous import get_or_create_anonymous_id
 from utils.counselor_assignment import assign_counselor
-from keyboards.menus import get_main_menu_keyboard, get_category_keyboard, get_chat_keyboard, get_language_keyboard
+from keyboards.menus import get_main_menu_keyboard, get_category_keyboard, get_chat_keyboard, get_language_keyboard, get_session_keyboard
 import config
 
 logger = logging.getLogger(__name__)
@@ -65,6 +54,13 @@ async def cmd_start(message: Message, state: FSMContext):
     # Get or create anonymous ID (needed for welcome message after language selection)
     get_or_create_anonymous_id(user_id)
     
+    if db.get_active_session(user_id):
+        lang = db.get_language(user_id)
+        await state.update_data(language=lang)
+        await state.set_state(UserStates.in_chat)
+        await message.answer("Session resumed / ውይይቱ ቀጥሏል", reply_markup=get_chat_keyboard(lang))
+        return
+
     # Ask for language
     await message.answer(
         "Please select your language / እባክዎ ቋንቋ ይምረጡ:",
@@ -73,7 +69,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(UserStates.waiting_for_language)
 
 
-@router.message(StateFilter(UserStates.waiting_for_language))
+@router.message(StateFilter(UserStates.waiting_for_language), ~F.text.startswith("/"))
 async def handle_language_selection(message: Message, state: FSMContext):
     """Handle language selection."""
     selection = message.text
@@ -89,6 +85,7 @@ async def handle_language_selection(message: Message, state: FSMContext):
         await message.answer("Please select from the menu / እባክዎ ከዝርዝሩ ውስጥ ይምረጡ")
         return
     
+    db.set_language(user_id, lang)
     # Save language to state
     await state.update_data(language=lang)
     
@@ -106,7 +103,7 @@ async def cmd_end(message: Message, state: FSMContext):
     
     # Get language from state, default to English
     data = await state.get_data()
-    lang = data.get("language", "en")
+    lang = data.get("language", db.get_language(message.from_user.id))
     
     try:
         # Clear state first but keep language
@@ -154,10 +151,10 @@ async def cmd_end(message: Message, state: FSMContext):
         
     except Exception as e:
         logger.error(f"Error in cmd_end: {e}", exc_info=True)
-        await message.answer(config.STRINGS["error_generic"][lang].format(error=str(e)))
+        await message.answer(config.STRINGS["error_generic"][lang].format(error="Please try again"))
 
 
-@router.message(StateFilter(UserStates.waiting_for_issue))
+@router.message(StateFilter(UserStates.waiting_for_issue), ~F.text.startswith("/"))
 async def handle_issue_selection(message: Message, state: FSMContext):
     """Handle issue category selection."""
     # Ignore commands
@@ -169,11 +166,12 @@ async def handle_issue_selection(message: Message, state: FSMContext):
     
     # Get language
     data = await state.get_data()
-    lang = data.get("language", "en")
+    lang = data.get("language", db.get_language(message.from_user.id))
     
     # Check if user selected a language instead of an issue (e.g. double click or old keyboard)
     if selected_text in ["English", "አማርኛ"]:
         new_lang = "en" if selected_text == "English" else "am"
+        db.set_language(user_id, new_lang)
         await state.update_data(language=new_lang)
         
         # Show welcome message with new language
@@ -205,6 +203,7 @@ async def handle_issue_selection(message: Message, state: FSMContext):
             if values[other_lang] == selected_text:
                 category_key = key
                 # Auto-switch language
+                db.set_language(user_id, other_lang)
                 await state.update_data(language=other_lang)
                 lang = other_lang
                 break
@@ -213,6 +212,9 @@ async def handle_issue_selection(message: Message, state: FSMContext):
             await message.answer(config.STRINGS["invalid_selection"][lang])
             return
     
+    if db.is_user_blocked(user_id):
+        await message.answer(config.STRINGS["blocked"][lang])
+        return
     # Check active session
     active_session = db.get_active_session(user_id)
     if active_session:
@@ -236,37 +238,32 @@ async def handle_issue_selection(message: Message, state: FSMContext):
     # Get anonymous ID
     anonymous_id = get_or_create_anonymous_id(user_id)
     
-    # Notify user
-    await message.answer(
-        config.STRINGS["connected"][lang].format(category=selected_text, anonymous_id=anonymous_id),
-        parse_mode="HTML",
-        reply_markup=get_chat_keyboard(lang)
-    )
-    
-    # Notify counselor
+    # Verify counselor delivery before promising the user a connection.
     try:
         from bot_instance import get_bot
-        bot = get_bot()
-        await bot.send_message(
+        await get_bot().send_message(
             counselor_id,
-            f"🔔 New counseling request\n\n"
-            f"Anonymous User: <code>{anonymous_id}</code>\n"
-            f"Category: {selected_text} ({lang})\n\n"
-            f"Use /counselor to manage your sessions.",
-            parse_mode="HTML"
+            f"New counseling request: {anonymous_id}\nCategory: {selected_text} ({lang})\nUse /counselor to reply."
         )
-    except Exception as e:
-        logger.error(f"Error notifying counselor: {e}")
-    
+    except Exception:
+        logger.warning("Counselor notification failed; closing unconfirmed session")
+        db.finish_session(session_id)
+        await message.answer(config.STRINGS["no_counselor"][lang])
+        return
+    await state.set_state(UserStates.in_chat)
+    await message.answer(
+        config.STRINGS["connected"][lang].format(category=selected_text, anonymous_id=anonymous_id),
+        parse_mode="HTML", reply_markup=get_chat_keyboard(lang)
+    )
     await state.set_state(UserStates.in_chat)
 
 
-@router.message(StateFilter(UserStates.in_chat))
+@router.message(StateFilter(UserStates.in_chat), ~F.text.startswith("/"))
 async def handle_chat_buttons(message: Message, state: FSMContext):
     """Handle chat buttons (End/Back)."""
     # Get language
     data = await state.get_data()
-    lang = data.get("language", "en")
+    lang = data.get("language", db.get_language(message.from_user.id))
     
     text = message.text
     end_text = config.STRINGS["buttons"]["end"][lang]
@@ -287,7 +284,7 @@ async def handle_return_back(message: Message, state: FSMContext):
     
     # Get language
     data = await state.get_data()
-    lang = data.get("language", "en")
+    lang = data.get("language", db.get_language(message.from_user.id))
     
     try:
         active_session = db.get_active_session(user_id)
@@ -316,7 +313,7 @@ async def handle_return_back(message: Message, state: FSMContext):
         
     except Exception as e:
         logger.error(f"Error in handle_return_back: {e}")
-        await message.answer(config.STRINGS["error_generic"][lang].format(error=str(e)))
+        await message.answer(config.STRINGS["error_generic"][lang].format(error="Please try again"))
 
 
 async def handle_user_message(message: Message, state: FSMContext):
@@ -327,7 +324,7 @@ async def handle_user_message(message: Message, state: FSMContext):
     
     user_id = message.from_user.id
     data = await state.get_data()
-    lang = data.get("language", "en")
+    lang = data.get("language", db.get_language(message.from_user.id))
     
     # Check if user is blocked
     if db.is_user_blocked(user_id):
@@ -343,78 +340,42 @@ async def handle_user_message(message: Message, state: FSMContext):
         return
     
     counselor_id = active_session["counselor_telegram_id"]
+    if not db.is_counselor(counselor_id):
+        await message.answer(config.STRINGS["no_counselor"][lang])
+        return
     session_id = active_session["session_id"]
     anonymous_id = db.get_user_anonymous_id(user_id)
     
-    # Save message to database
-    message_type = "text"
-    content = message.text
-    file_id = None
-    
-    if message.photo:
-        message_type = "photo"
-        content = message.caption or ""
-        file_id = message.photo[-1].file_id
-    elif message.voice:
-        message_type = "voice"
-        content = ""
-        file_id = message.voice.file_id
-    elif message.video:
-        message_type = "video"
-        content = message.caption or ""
-        file_id = message.video.file_id
-    elif message.document:
-        message_type = "document"
-        content = message.caption or ""
-        file_id = message.document.file_id
-    
-    db.save_message(session_id, user_id, message_type, content, file_id)
-    
-    # Forward message to counselor
+    item = payload(message)
+    if item is None:
+        await message.answer("Please send text, a photo, voice, video or document. / ጽሑፍ፣ ፎቶ፣ ድምጽ፣ ቪዲዮ ወይም ሰነድ ይላኩ።")
+        return
+    message_type, content, file_id = item
+    message_id = db.save_message(session_id, user_id, message_type, content, file_id)
+    if not message_id:
+        await message.answer("Unable to save message. Please try again.")
+        return
     try:
         from bot_instance import get_bot
         bot = get_bot()
-        
-        if message_type == "text":
-            await bot.send_message(
-                counselor_id,
-                f"💬 Message from {anonymous_id}:\n\n{content}"
-            )
-        elif message_type == "photo":
-            await bot.send_photo(
-                counselor_id,
-                file_id,
-                caption=f"📷 Photo from {anonymous_id}" + (f":\n{content}" if content else "")
-            )
-        elif message_type == "voice":
-            await bot.send_voice(
-                counselor_id,
-                file_id,
-                caption=f"🎤 Voice message from {anonymous_id}"
-            )
-        elif message_type == "video":
-            await bot.send_video(
-                counselor_id,
-                file_id,
-                caption=f"🎥 Video from {anonymous_id}" + (f":\n{content}" if content else "")
-            )
-        elif message_type == "document":
-            await bot.send_document(
-                counselor_id,
-                file_id,
-                caption=f"📄 Document from {anonymous_id}" + (f":\n{content}" if content else "")
-            )
+        await deliver(bot, counselor_id, f"Message from {anonymous_id}", item, reply_markup=get_session_keyboard(session_id))
+        db.set_delivery_status(message_id, "delivered")
     except Exception as e:
-        logger.error(f"Error forwarding message to counselor: {e}")
+        db.set_delivery_status(message_id, "failed")
+        logger.error("Telegram delivery failed (%s)", type(e).__name__)
         error_msg = config.STRINGS["error_generic"][lang].format(error="Message delivery failed")
         await message.answer(error_msg)
 
 
 @router.message()
-async def handle_other_messages(message: Message):
+async def handle_other_messages(message: Message, state: FSMContext):
     """Handle other messages."""
     if message.text and message.text.startswith('/'):
         return
     
+    if db.get_active_session(message.from_user.id):
+        await state.set_state(UserStates.in_chat)
+        await handle_chat_buttons(message, state)
+        return
     # Default to English for generic welcome
     await message.answer(config.STRINGS["welcome_back"]["en"])
